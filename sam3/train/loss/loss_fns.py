@@ -147,9 +147,20 @@ def sigmoid_focal_loss(
     Returns:
         Loss tensor
     """
-    if not (0 <= alpha <= 1) and triton:
+    # LOCAL FIX (root cause of our NaN, verified by annotation.nan_audit): the Triton backward
+    # computes the modulating factor as pow(1 - p_t, gamma - 1) * (1 - p_t). At gamma == 0 that is
+    # pow(., -1) = inf when 1 - p_t == 0, then inf * 0 = NaN -- while the FORWARD returns a clean
+    # 0.0, so trainer.py's math.isfinite(loss) guard never fires and the NaN only appears in the
+    # gradient. `presence_gamma` defaults to 0.0 and our config enables use_presence, so the
+    # presence loss took this path; every presence logit past +-16.6355 (where fp32 sigmoid
+    # saturates to exactly 1.0) produced a NaN gradient. That was the burst of inf detections that
+    # ratcheted the GradScaler to 3.3e-39.
+    # At gamma == 0 focal loss IS alpha-weighted BCE, so the eager path is mathematically identical
+    # (measured: bit-identical forward) and costs ~80us on the (B,1) presence tensor vs a ~0.4s step.
+    use_triton = triton and gamma != 0
+    if not (0 <= alpha <= 1) and use_triton:
         raise RuntimeError(f"Alpha should be in [0,1], got {alpha}")
-    if triton:
+    if use_triton:
         if reduce and not loss_on_multimask:
             loss = triton_sigmoid_focal_loss_reduce(inputs, targets, alpha, gamma)
             return loss / (num_boxes * inputs.shape[1])
@@ -263,6 +274,43 @@ class LossWithWeights(nn.Module):
         return reduced_loss
 
 
+def _matched_mask_iou(outputs, targets, indices):
+    """LOCAL: mask IoU for the Hungarian-matched (query, target) pairs.
+
+    Returns (iou, valid) each of shape [M] following `indices`, or (None, None) when
+    masks aren't available -- which is the case for the auxiliary decoder layers
+    (`sam3_image.py` builds them with aux_masks=False, so they carry no `pred_masks`)
+    and for box-only datasets. Callers fall back to box IoU there.
+
+    Mirrors the resolution handling in `Masks.get_loss`: predictions are logits at the
+    segmentation head's resolution and get upsampled to the target mask size, so the
+    quality signal here measures the same thing the mask loss optimises.
+    """
+    if "pred_masks" not in outputs or targets.get("masks") is None:
+        return None, None
+    src = outputs["pred_masks"][(indices[0], indices[1])]
+    if src.numel() == 0:
+        return None, None
+    tgt = targets["masks"] if indices[2] is None else targets["masks"][indices[2]]
+    valid = targets.get("is_valid_mask")
+    if valid is None:
+        valid = torch.ones(src.shape[0], dtype=torch.bool, device=src.device)
+    elif indices[2] is not None:
+        valid = valid[indices[2]]
+
+    if src.dim() == 3:
+        src = src[:, None]
+    # bilinear doesn't support bf16, and we want exact areas anyway
+    src = interpolate(
+        src.to(torch.float32), size=tgt.shape[-2:], mode="bilinear", align_corners=False
+    )[:, 0]
+    pred = src > 0  # pred_masks are logits: sigmoid()>0.5 <=> logit>0
+    gt = tgt.to(torch.bool)
+    inter = (pred & gt).flatten(1).sum(1).float()
+    union = (pred | gt).flatten(1).sum(1).float()
+    return inter / union.clamp(min=1.0), valid.to(torch.bool)
+
+
 class IABCEMdetr(LossWithWeights):
     def __init__(
         self,
@@ -289,13 +337,23 @@ class IABCEMdetr(LossWithWeights):
         presence_alpha=0.5,
         presence_gamma=0.0,
         pos_focal: bool = False,  # for box scores, use focal loss for positives as well
+        mask_iou_weight: float = 0.0,
     ):
         super().__init__(weight_dict, compute_aux)
         self.pos_weight = pos_weight
         self.gamma = gamma
         self.weak_loss = weak_loss
         self.alpha = alpha
+        # LOCAL: this is Align-DETR's IA-BCE -- the classification target is pulled toward
+        # the localisation quality of the matched prediction. Upstream measures that quality
+        # with BOX IoU, which is a poor proxy for categories whose box barely moves while the
+        # mask boundary does (fluids, orifices). `mask_iou_weight` blends MASK IoU into that
+        # target: 0.0 = upstream behaviour, 1.0 = quality measured purely by mask IoU.
+        # Falls back to box IoU wherever masks are unavailable (aux layers, box-only data).
+        self.mask_iou_weight = mask_iou_weight
         self.target_keys.append("boxes_xyxy")
+        if mask_iou_weight > 0.0:
+            self.target_keys.extend(["masks", "is_valid_mask"])
         self.no_loss_for_fp_propagation = no_loss_for_fp_propagation
         if self.weak_loss:
             self.target_keys.append("is_exhaustive")
@@ -367,6 +425,21 @@ class IABCEMdetr(LossWithWeights):
             )
 
             iou = box_ops.fast_diag_box_iou(src_boxes_xyxy, target_boxes_giou)
+            ia_box_iou = ia_mask_iou = None
+            if self.mask_iou_weight > 0.0:
+                # LOCAL: measure the matched prediction's quality by mask IoU, not box IoU
+                m_iou, m_valid = _matched_mask_iou(outputs, targets, indices)
+                if m_iou is not None:
+                    # emitted together, so the logged keys stay consistent across steps
+                    zero = torch.zeros((), dtype=iou.dtype, device=iou.device)
+                    ia_box_iou = iou.mean() if iou.numel() else zero
+                    ia_mask_iou = m_iou[m_valid].mean() if bool(m_valid.any()) else zero
+                    w = torch.where(
+                        m_valid,
+                        torch.full_like(iou, self.mask_iou_weight),
+                        torch.zeros_like(iou),
+                    )
+                    iou = (1.0 - w) * iou + w * m_iou.to(iou.dtype)
             t = prob[(indices[0], indices[1])] ** self.alpha * iou ** (1 - self.alpha)
             t = torch.clamp(t, 0.01).detach()
             positive_target_classes = target_classes.clone()
@@ -517,6 +590,12 @@ class IABCEMdetr(LossWithWeights):
             "presence_loss": presence_loss,
             "presence_dec_acc": presence_dec_acc,
         }
+        # LOCAL: log-only diagnostics -- how far the matched predictions' box quality and
+        # mask quality actually drift apart. Not in weight_dict, so they never enter the
+        # optimised loss; they just show up in the meters.
+        if ia_box_iou is not None:
+            losses["ia_box_iou"] = ia_box_iou
+            losses["ia_mask_iou"] = ia_mask_iou
         return losses
 
 
