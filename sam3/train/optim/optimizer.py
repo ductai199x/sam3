@@ -386,9 +386,14 @@ class GradientClipper:
 
     def __call__(self, model: nn.Module):
         if self.max_norm is None:
-            return  # no-op
+            return None  # no-op
 
-        nn.utils.clip_grad_norm_(
+        # LOCAL: return the pre-clip total norm so the caller can skip a non-finite step. It is
+        # computed here anyway, so this is free -- far cheaper than a second pass over 840M params.
+        # NOTE the norm is NaN if ANY gradient is NaN, and clip_grad_norm_ then multiplies every
+        # gradient by a NaN coefficient; that is harmless only because the caller skips the step
+        # and zero_grad(set_to_none=True) clears them next iteration.
+        return nn.utils.clip_grad_norm_(
             model.parameters(), max_norm=self.max_norm, norm_type=self.norm_type
         )
 

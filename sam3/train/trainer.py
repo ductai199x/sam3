@@ -833,18 +833,67 @@ class Trainer:
                             )
 
                 # Clipping gradients and detecting diverging gradients
+                grad_norm = None
                 if self.gradient_clipper is not None:
                     self.scaler.unscale_(self.optim.optimizer)
-                    self.gradient_clipper(model=self.model)
+                    grad_norm = self.gradient_clipper(model=self.model)
 
                 if self.gradient_logger is not None:
                     self.gradient_logger(
                         self.model, rank=self.distributed_rank, where=self.where
                     )
 
-                # Optimizer step: the scaler will make sure gradients are not
-                # applied if the gradients are infinite
-                self.scaler.step(self.optim.optimizer)
+                # Opt-in diagnostic (SAM3_NAN_WATCH=1): report the exact step at which a run goes
+                # non-finite, and whether it is the GRADIENTS (a bad batch or exploding backward,
+                # which the skip above then catches) or the WEIGHTS (an update that landed and
+                # poisoned the model). Distinguishing those two is only possible from inside the
+                # step.
+                #
+                # Caveat worth knowing before relying on it: a NaN born anywhere in the backward
+                # propagates to every parameter upstream of it, so the list of affected tensors is
+                # essentially "all of them" and identifies nothing. Use it to find WHEN and WHETHER
+                # weights were hit; to find WHERE a NaN originates, exercise each candidate op in
+                # isolation and check its backward.
+                if os.environ.get("SAM3_NAN_WATCH"):
+                    bad_g = [
+                        n for n, p in self.model.named_parameters()
+                        if p.grad is not None and not torch.isfinite(p.grad).all()
+                    ]
+                    bad_w = [
+                        n for n, p in self.model.named_parameters()
+                        if not torch.isfinite(p).all()
+                    ]
+                    if bad_g or bad_w:
+                        logging.error(
+                            f"[nanwatch] step={self.steps[phase]} epoch={self.epoch} "
+                            f"scaler_scale={self.scaler.get_scale()} "
+                            f"non-finite GRADS in {len(bad_g)} tensors, "
+                            f"non-finite WEIGHTS in {len(bad_w)} tensors"
+                        )
+                        for n in (bad_g[:5] or []):
+                            logging.error(f"[nanwatch]   grad: {n}")
+                        for n in (bad_w[:5] or []):
+                            logging.error(f"[nanwatch]   weight: {n}")
+                        if bad_w and os.environ.get("SAM3_NAN_WATCH") == "raise":
+                            raise FloatingPointError("weights went non-finite; see [nanwatch]")
+
+                # Explicit non-finite-gradient skip. GradScaler.step() used to provide this
+                # incidentally, so disabling it under bf16 (above) requires a replacement -- and it
+                # is a better primitive anyway: GradScaler welds "skip this bad step" to
+                # "permanently change the loss scale", and those should be separate decisions.
+                #
+                # Deliberately LOUD. A silently-skipped step lets training quietly stop while every
+                # visible signal still looks fine, so these are counted and reported; a rising
+                # count is the signal that something upstream is producing non-finite gradients.
+                if grad_norm is not None and not torch.isfinite(grad_norm):
+                    self._nonfinite_steps = getattr(self, "_nonfinite_steps", 0) + 1
+                    logging.error(
+                        f"[gradskip] step={self.steps[phase]} epoch={self.epoch} "
+                        f"grad_norm={grad_norm} -- SKIPPING optimizer step "
+                        f"(total skipped this run: {self._nonfinite_steps})"
+                    )
+                else:
+                    self.scaler.step(self.optim.optimizer)
                 self.scaler.update()
 
                 # measure elapsed time
@@ -1084,10 +1133,30 @@ class Trainer:
         if self.meters_conf:
             self.meters = instantiate(self.meters_conf, _convert_="all")
 
-        self.scaler = torch.amp.GradScaler(
-            self.device,
-            enabled=self.optim_conf.amp.enabled if self.optim_conf else False,
-        )
+        # The scaler must follow the amp DTYPE, not the shared amp.enabled flag (which also drives
+        # autocast). Loss scaling exists to stop fp16 gradients UNDERFLOWING; bf16 carries fp32's
+        # exponent range and needs none of it, so under bf16 the scaler is pure downside.
+        #
+        # It is also actively dangerous. The scale halves on any inf but only doubles after
+        # `growth_interval` (2000) clean steps, so any persistent source of non-finite gradients
+        # ratchets it monotonically down -- unwinnable, since one bad step undoes thousands of good
+        # ones. Once the scale is small enough that 1/scale overflows fp32 (below ~2.94e-39), the
+        # unscale step computes 0 * inf and the scaler MANUFACTURES the NaN it is meant to detect,
+        # with found_inf staying 0 -- at which point it writes NaN into the weights undetected.
+        # Before that it merely skips every step, so training silently stops while the loss curve
+        # still looks healthy and only a plateau in the eval metrics hints at it.
+        #
+        # Log scaler.get_scale() if you keep a scaler for fp16: it is the earliest canary, visible
+        # long before the loss or the metrics move. See pytorch#99640.
+        _amp_on = bool(self.optim_conf) and bool(self.optim_conf.amp.enabled)
+        _amp_dtype = get_amp_type(self.optim_conf.amp.amp_dtype) if _amp_on else None
+        _needs_scaler = _amp_on and _amp_dtype == torch.float16
+        if _amp_on and not _needs_scaler:
+            logging.info(
+                f"[amp] autocast {_amp_dtype} -> GradScaler DISABLED "
+                f"(loss scaling is fp16-only; non-finite grads are skipped explicitly instead)"
+            )
+        self.scaler = torch.amp.GradScaler(self.device, enabled=_needs_scaler)
 
         self.gradient_clipper = (
             instantiate(self.optim_conf.gradient_clip) if self.optim_conf else None
