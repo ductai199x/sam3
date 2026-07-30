@@ -6,6 +6,9 @@
 Modules to compute the matching cost and solve the corresponding LSAP.
 """
 
+import logging
+import os
+
 import numpy as np
 import torch
 from sam3.model.box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
@@ -16,6 +19,35 @@ from torch import nn
 def _do_matching(cost, repeats=1, return_tgt_indices=False, do_filtering=False):
     if repeats > 1:
         cost = np.tile(cost, (1, repeats))
+
+    # LOCAL: bf16 + a hot LR can push a single cost entry to NaN/inf, and scipy then aborts the
+    # whole run with "matrix contains invalid numeric entries".
+    #
+    # CAUTION (learned the hard way 2026-07-30): sanitizing here is NOT harmless. The matcher runs
+    # under no_grad, so a sanitized cost yields an ARBITRARY assignment while the loss stays
+    # finite -- training then continues on garbage targets. Our 4-GPU run did exactly that for 55
+    # consecutive steps before the loss finally went NaN, which destroyed the evidence of what
+    # actually broke. Set SAM3_MATCHER_STRICT=1 to raise on the FIRST bad matrix instead, which is
+    # what you want when reproducing an instability.
+    if not np.all(np.isfinite(cost)):
+        _bad = ~np.isfinite(cost)
+        _n = int(_bad.sum())
+        msg = (
+            f"matcher: cost matrix had {_n}/{cost.size} non-finite entries "
+            f"(nan={int(np.isnan(cost).sum())} posinf={int(np.isposinf(cost).sum())} "
+            f"neginf={int(np.isneginf(cost).sum())}); "
+            f"finite range [{np.nanmin(cost[~_bad]) if (~_bad).any() else float('nan'):.4g}, "
+            f"{np.nanmax(cost[~_bad]) if (~_bad).any() else float('nan'):.4g}]"
+        )
+        if os.environ.get("SAM3_MATCHER_STRICT"):
+            raise FloatingPointError(msg)
+        # neginf -> +1e9, NOT -1e9. A large NEGATIVE cost is maximally ATTRACTIVE to
+        # linear_sum_assignment, so the old `neginf=-1e9` made the solver preferentially pick
+        # exactly the pairs whose cost had broken -- the opposite of avoiding them. All three
+        # sentinels must be repulsive. (Ultralytics/MaskDINO/HF-Mask2Former use 0.0 here and have
+        # the same inversion; RF-DETR is the one that gets it right, with max_finite+|max|+1.)
+        logging.warning(msg + "; sanitizing (nan/+-inf -> +1e9, repulsive)")
+        cost = np.nan_to_num(cost, nan=1e9, posinf=1e9, neginf=1e9)
 
     i, j = linear_sum_assignment(cost)
     if do_filtering:
@@ -151,6 +183,29 @@ class HungarianMatcher(nn.Module):
         cost_giou = -generalized_box_iou(
             box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox)
         )
+
+        # LOCAL DIAGNOSTIC: attribute a non-finite cost to its SOURCE. Knowing only that the summed
+        # matrix is bad is useless -- the whole question is whether the model's own outputs arrived
+        # non-finite (an upstream forward/optimiser problem) or whether a finite input produced a
+        # non-finite cost (a bug in these three formulas, e.g. giou dividing by a zero enclosing
+        # area). Costs nothing on the healthy path: four .isfinite().all() reductions.
+        _terms = {
+            "out_prob": out_prob, "out_bbox": out_bbox, "tgt_bbox": tgt_bbox,
+            "cost_class": cost_class, "cost_bbox": cost_bbox, "cost_giou": cost_giou,
+        }
+        _bad = [k for k, v in _terms.items() if not torch.isfinite(v).all()]
+        if _bad:
+            det = []
+            for k in _bad:
+                v = _terms[k].float()
+                det.append(
+                    f"{k}[{int((~torch.isfinite(v)).sum())}/{v.numel()} bad, "
+                    f"finite absmax={v[torch.isfinite(v)].abs().max().item() if torch.isfinite(v).any() else float('nan'):.4g}]"
+                )
+            msg = "matcher inputs/terms non-finite: " + " ".join(det)
+            if os.environ.get("SAM3_MATCHER_STRICT"):
+                raise FloatingPointError(msg)
+            logging.warning(msg)
 
         # Final cost matrix
         C = (
@@ -371,9 +426,13 @@ class BinaryFocalHungarianMatcher(nn.Module):
         if self.stable:
             rescaled_giou = (-cost_giou + 1) / 2
             out_prob = out_prob.unsqueeze(-1).expand_as(cost_bbox) * rescaled_giou
-            cost_class = -self.alpha * (1 - out_prob) ** self.gamma * torch.log(
-                out_prob
-            ) + (1 - self.alpha) * out_prob**self.gamma * torch.log(1 - out_prob)
+            # LOCAL eps: out_prob is scaled by rescaled_giou, which is exactly 0 for disjoint
+            # boxes (giou == -1), so log(0) = -inf. Dead for us (config sets stable=false, which
+            # confusingly selects the SAFE logsigmoid branch) but must never be able to NaN.
+            _p = out_prob.clamp(min=1e-7, max=1 - 1e-7)
+            cost_class = -self.alpha * (1 - _p) ** self.gamma * torch.log(
+                _p
+            ) + (1 - self.alpha) * _p**self.gamma * torch.log(1 - _p)
         else:
             # directly computing log sigmoid (more numerically stable)
             log_out_prob = torch.nn.functional.logsigmoid(out_score)
@@ -583,9 +642,12 @@ class BinaryHungarianMatcherV2(nn.Module):
             if self.stable:
                 rescaled_giou = (-cost_giou + 1) / 2
                 out_prob = out_prob.unsqueeze(-1).expand_as(cost_bbox) * rescaled_giou
-                cost_class = -self.alpha * (1 - out_prob) ** self.gamma * torch.log(
-                    out_prob
-                ) + (1 - self.alpha) * out_prob**self.gamma * torch.log(1 - out_prob)
+                # LOCAL eps: see the sibling copy above -- rescaled_giou is 0 for disjoint
+                # boxes, so out_prob hits 0 and log(0) = -inf.
+                _p = out_prob.clamp(min=1e-7, max=1 - 1e-7)
+                cost_class = -self.alpha * (1 - _p) ** self.gamma * torch.log(
+                    _p
+                ) + (1 - self.alpha) * _p**self.gamma * torch.log(1 - _p)
             else:
                 # directly computing log sigmoid (more numerically stable)
                 log_out_prob = torch.nn.functional.logsigmoid(out_score)
