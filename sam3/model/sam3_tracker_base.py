@@ -17,7 +17,7 @@ try:
     from timm.layers import trunc_normal_
 except ModuleNotFoundError:
     # compatibility for older timm versions
-    from timm.models.layers import trunc_normal_
+    from timm.layers import trunc_normal_
 
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0

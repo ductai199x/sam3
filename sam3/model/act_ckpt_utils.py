@@ -49,6 +49,11 @@ def activation_ckpt_wrapper(module: Union[nn.Module, Callable]) -> Callable:
     def act_ckpt_wrapper(
         *args, act_ckpt_enable: bool = True, use_reentrant: bool = False, **kwargs
     ):
+        # LOCAL PATCH (finetuning): force-disable activation checkpointing. This model's forward
+        # isn't cleanly recomputable under torch's non-reentrant checkpoint -- recompute yields
+        # mismatched tensor metadata (e.g. [1,16,32,32] vs [1,1,32,32], CPU vs CUDA scalars) ->
+        # CheckpointError. We have ample GPU memory for a bs=1 finetune, so just run eager.
+        act_ckpt_enable = False
         if act_ckpt_enable:
             if len(args) > 0:
                 raise ValueError(

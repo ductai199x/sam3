@@ -12,6 +12,18 @@ from copy import deepcopy
 
 import submitit
 import torch
+# LOCAL PATCH (finetuning): disable torch activation checkpointing globally — in the main process AND
+# every spawned GPU worker (start_method='spawn' re-imports this module, so patching here reaches them,
+# unlike a launcher-level monkeypatch). This model's forward isn't cleanly recomputable under torch's
+# non-reentrant checkpoint (recompute -> mismatched tensor metadata -> CheckpointError); we have GPU
+# memory to spare for bs=1. Placed before any sam3.model import so `from torch.utils.checkpoint import
+# checkpoint` bindings in the model also pick up the passthrough.
+import torch.utils.checkpoint as _actckpt
+def _ckpt_passthrough(function, *args, **kwargs):
+    for _k in ("use_reentrant", "context_fn", "determinism_check", "debug", "preserve_rng_state"):
+        kwargs.pop(_k, None)
+    return function(*args, **kwargs)
+_actckpt.checkpoint = _ckpt_passthrough
 from hydra import compose, initialize_config_module
 from hydra.utils import instantiate
 from iopath.common.file_io import g_pathmgr

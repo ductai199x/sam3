@@ -72,7 +72,15 @@ def setup_distributed_backend(backend, timeout_mins):
     # of waiting
     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
     logging.info(f"Setting up torch.distributed with a timeout of {timeout_mins} mins")
-    dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout_mins))
+    dist.init_process_group(
+        backend=backend,
+        timeout=timedelta(minutes=timeout_mins),
+        device_id=(
+            torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
+            if torch.cuda.is_available()
+            else None
+        ),
+    )
     return dist.get_rank()
 
 

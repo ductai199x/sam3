@@ -23,8 +23,7 @@ try:
 
     HAS_TIDE = True
 except ImportError:
-    HAS_TIDE = False
-    print("WARNING: TIDE not installed. Detailed analysis will not be available.")
+    HAS_TIDE = False  # tidecv is optional (detailed TIDE error analysis); disabled when absent
 
 
 # the COCO detection metrics (https://github.com/cocodataset/cocoapi/blob/8c9bcc3cf640524c4c20a9c40e89cb6a2f2fa0e9/PythonAPI/pycocotools/cocoeval.py#L460-L471)
