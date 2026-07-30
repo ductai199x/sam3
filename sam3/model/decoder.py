@@ -586,10 +586,16 @@ class TransformerDecoder(nn.Module):
                 ).squeeze(-1)
 
                 # clamp to mitigate numerical issues
+                # LOCAL FIX: `.clamp()` is NOT in-place and the result was discarded, so this guard
+                # has never once executed -- clamp_presence_logit_max_val=10.0 was dead code and
+                # presence logits ran free past the +-16.6355 fp32-sigmoid saturation point that
+                # makes the focal backward NaN. Assign the result.
                 if self.clamp_presence_logits:
-                    intermediate_layer_presence_logits.clamp(
-                        min=-self.clamp_presence_logit_max_val,
-                        max=self.clamp_presence_logit_max_val,
+                    intermediate_layer_presence_logits = (
+                        intermediate_layer_presence_logits.clamp(
+                            min=-self.clamp_presence_logit_max_val,
+                            max=self.clamp_presence_logit_max_val,
+                        )
                     )
 
                 intermediate_presence_logits.append(intermediate_layer_presence_logits)
