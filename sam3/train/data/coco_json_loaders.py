@@ -113,6 +113,8 @@ class COCO_FROM_JSON:
         prompts=None,
         include_negatives=True,
         category_chunk_size=None,
+        exhaustive=True,
+        non_exhaustive_cats=None,
     ):
         """
         Initialize the COCO training API.
@@ -121,6 +123,20 @@ class COCO_FROM_JSON:
             annotation_file (str): Path to COCO JSON annotation file
             prompts: Optional custom prompts for categories
             include_negatives (bool): Whether to include negative examples (categories with no instances)
+            exhaustive (bool): global default for `is_exhaustive` on every emitted query
+            non_exhaustive_cats (list[str]): category NAMES forced non-exhaustive everywhere
+                (e.g. a class the annotator only labels for one subject type)
+
+        LOCAL EXTENSION — per-image query control. Two optional fields on each entry of
+        the COCO `images` list let the exporter say *which* categories a given image was
+        actually swept for:
+            "query_cat_ids":  [ids]  -> only these categories get a query at all. Categories
+                                        outside the list emit NO query (neither positive nor
+                                        negative), so an image annotated for only some classes
+                                        never teaches a false negative on the rest.
+            "nonexh_cat_ids": [ids]  -> these categories still get a query, but marked
+                                        is_exhaustive=False for this image only.
+        Both default to None (= old behaviour: every category queried, global `exhaustive`).
         """
         self._raw_data, self._cat_idx_to_text = load_coco_and_group_by_image(
             annotation_file
@@ -128,6 +144,15 @@ class COCO_FROM_JSON:
         self._sorted_cat_ids = sorted(list(self._cat_idx_to_text.keys()))
         self.prompts = None
         self.include_negatives = include_negatives
+        self.exhaustive = exhaustive  # LOCAL: allow non-exhaustive queries (don't penalize finding unlabeled instances)
+        _nonexh = set(non_exhaustive_cats or [])
+        self._nonexh_cat_ids = {
+            cid for cid, name in self._cat_idx_to_text.items() if name in _nonexh
+        }
+        if _nonexh and not self._nonexh_cat_ids:
+            raise ValueError(
+                f"non_exhaustive_cats={sorted(_nonexh)} match no category in {annotation_file}"
+            )
         self.category_chunk_size = (
             category_chunk_size
             if category_chunk_size is not None
@@ -179,7 +204,7 @@ class COCO_FROM_JSON:
             "input_box": None,
             "input_box_label": None,
             "input_points": None,
-            "is_exhaustive": True,
+            "is_exhaustive": getattr(self, "exhaustive", True),
         }
 
         annot_template = {
@@ -205,7 +230,16 @@ class COCO_FROM_JSON:
             (cat_id, cat_id_to_anns[cat_id]) for cat_id in cat_chunk
         ]
 
+        # LOCAL: per-image query scoping (see __init__ docstring)
+        allowed_cat_ids = image_info.get("query_cat_ids")
+        if allowed_cat_ids is not None:
+            allowed_cat_ids = set(allowed_cat_ids)
+        img_nonexh = set(image_info.get("nonexh_cat_ids") or ())
+
         for cat_id, anns in annotations_by_cat_sorted:
+            if allowed_cat_ids is not None and cat_id not in allowed_cat_ids:
+                # this image was not swept for this category -> emit no query at all
+                continue
             if len(anns) == 0 and not self.include_negatives:
                 continue
 
@@ -248,6 +282,12 @@ class COCO_FROM_JSON:
                 else self.prompts[cat_id]
             )
             query["object_ids_output"] = cur_ann_ids
+            # LOCAL: per-category / per-image exhaustivity
+            query["is_exhaustive"] = (
+                bool(self.exhaustive)
+                and cat_id not in self._nonexh_cat_ids
+                and cat_id not in img_nonexh
+            )
             queries.append(query)
 
         return queries, annotations
@@ -326,7 +366,7 @@ class SAM3_EVAL_API_FROM_JSON_NP:
             "input_box": None,
             "input_box_label": None,
             "input_points": None,
-            "is_exhaustive": True,
+            "is_exhaustive": getattr(self, "exhaustive", True),
         }
 
         # Create query
@@ -424,7 +464,7 @@ class SAM3_VEVAL_API_FROM_JSON_NP:
             "input_box": None,
             "input_box_label": None,
             "input_points": None,
-            "is_exhaustive": True,
+            "is_exhaustive": getattr(self, "exhaustive", True),
         }
 
         all_np_ids = self._video_id_to_np_ids[cur_vid_data["id"]]
