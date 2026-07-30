@@ -113,6 +113,7 @@ def box_iou(boxes1, boxes2):
     inter = wh[..., 0] * wh[..., 1]  # (..., N, M)
 
     union = area1[..., None] + area2[..., None, :] - inter
+    union = union.clamp(min=1e-7)  # LOCAL: never divide by 0 (both boxes zero-area)
 
     iou = inter / union
     return iou, union
@@ -139,7 +140,7 @@ def generalized_box_iou(boxes1, boxes2):
     rb = torch.max(boxes1[..., :, None, 2:], boxes2[..., None, :, 2:])
 
     wh = (rb - lt).clamp(min=0)  # (..., N, M, 2)
-    area = wh[..., 0] * wh[..., 1]  # (..., N, M)
+    area = (wh[..., 0] * wh[..., 1]).clamp(min=1e-7)  # LOCAL: eps, see union above
 
     return iou - (area - union) / area
 
@@ -164,7 +165,8 @@ def fast_diag_generalized_box_iou(boxes1, boxes2):
     inter = (rb - lt).clamp(min=0).prod(-1)
     tot_area = (rb2 - lt2).clamp(min=0).prod(-1)
 
-    union = area1 + area2 - inter
+    union = (area1 + area2 - inter).clamp(min=1e-7)   # LOCAL eps: both boxes zero-area -> 0/0
+    tot_area = tot_area.clamp(min=1e-7)               # LOCAL eps: degenerate enclosing box
 
     iou = inter / union
 
@@ -188,7 +190,7 @@ def fast_diag_box_iou(boxes1, boxes2):
 
     inter = (rb - lt).clamp(min=0).prod(-1)
 
-    union = area1 + area2 - inter
+    union = (area1 + area2 - inter).clamp(min=1e-7)   # LOCAL eps
 
     iou = inter / union
 
