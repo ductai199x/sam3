@@ -8,6 +8,7 @@ import random
 import sys
 import traceback
 from argparse import ArgumentParser
+from pathlib import Path
 from copy import deepcopy
 
 import submitit
@@ -24,7 +25,7 @@ def _ckpt_passthrough(function, *args, **kwargs):
         kwargs.pop(_k, None)
     return function(*args, **kwargs)
 _actckpt.checkpoint = _ckpt_passthrough
-from hydra import compose, initialize_config_module
+from hydra import compose, initialize_config_dir, initialize_config_module
 from hydra.utils import instantiate
 from iopath.common.file_io import g_pathmgr
 from omegaconf import OmegaConf
@@ -64,6 +65,14 @@ def single_proc_run(local_rank, main_port, cfg, world_size):
         register_omegaconf_resolvers()
     except Exception as e:
         logging.info(e)
+
+    # Opt-in (SAM3_CKPT_DEBUG=1): make a CheckpointError name the module whose recompute
+    # disagreed with the forward. Without it the error reports only tensor metadata, which is
+    # not enough to find the offending op in a 840M-parameter model.
+    if os.environ.get("SAM3_CKPT_DEBUG"):
+        import torch.utils.checkpoint as _ckpt
+
+        _ckpt.set_checkpoint_debug_enabled(True)
 
     trainer = instantiate(cfg.trainer, _recursive_=False)
     trainer.run()
@@ -322,14 +331,13 @@ def main(args) -> None:
 
 
 if __name__ == "__main__":
-    initialize_config_module("sam3.train", version_base="1.2")
     parser = ArgumentParser()
     parser.add_argument(
         "-c",
         "--config",
         required=True,
         type=str,
-        help="path to config file (e.g. configs/roboflow_v100_full_ft_100_images.yaml)",
+        help="config: a path to any YAML on disk, or a name relative to the sam3.train package",
     )
     parser.add_argument(
         "--use-cluster",
@@ -346,5 +354,21 @@ if __name__ == "__main__":
     parser.add_argument("--num-nodes", type=int, default=None, help="Number of nodes")
     args = parser.parse_args()
     args.use_cluster = bool(args.use_cluster) if args.use_cluster is not None else None
+
+    # LOCAL: accept a config ANYWHERE on disk, not only one shipped inside this package.
+    #
+    # Upstream hardcodes initialize_config_module("sam3.train"), so Hydra can only see YAML that
+    # lives under the installed package -- which forces a project to either vendor its configs into
+    # the checkout or symlink them in. Both put project-specific files inside a third-party tree and
+    # make `git rebase upstream/main` messier than it needs to be. If -c resolves to a real file we
+    # point Hydra at that file's directory instead; otherwise the original package-relative lookup
+    # is used unchanged, so every upstream invocation still works.
+    cfg_path = Path(args.config).expanduser()
+    if cfg_path.is_file():
+        initialize_config_dir(config_dir=str(cfg_path.resolve().parent), version_base="1.2")
+        args.config = cfg_path.stem
+    else:
+        initialize_config_module("sam3.train", version_base="1.2")
+
     register_omegaconf_resolvers()
     main(args)
