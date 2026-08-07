@@ -832,11 +832,23 @@ class Trainer:
                                 self.steps[phase],
                             )
 
-                # Clipping gradients and detecting diverging gradients
+                # Clipping gradients and detecting diverging gradients.
+                #
+                # grad_norm doubles as the non-finite detector below, so it must exist on every
+                # path where the GradScaler is not doing that job. Under fp16 the scaler's step()
+                # inspects every gradient itself; under bf16 (or no autocast) it is disabled and
+                # this is the only check. The clipper already produces the total norm -- which is
+                # non-finite iff any gradient is -- so reuse it and only pay for a second pass
+                # when no clipper is configured. max_norm=inf yields the norm without clipping.
                 grad_norm = None
                 if self.gradient_clipper is not None:
                     self.scaler.unscale_(self.optim.optimizer)
                     grad_norm = self.gradient_clipper(model=self.model)
+                elif not self._needs_scaler:
+                    self.scaler.unscale_(self.optim.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), float("inf")
+                    )
 
                 if self.gradient_logger is not None:
                     self.gradient_logger(
@@ -1156,6 +1168,9 @@ class Trainer:
                 f"[amp] autocast {_amp_dtype} -> GradScaler DISABLED "
                 f"(loss scaling is fp16-only; non-finite grads are skipped explicitly instead)"
             )
+        # kept on self: the training step needs it to know whether the scaler is checking
+        # gradients for it, or whether it has to do that itself
+        self._needs_scaler = _needs_scaler
         self.scaler = torch.amp.GradScaler(self.device, enabled=_needs_scaler)
 
         self.gradient_clipper = (
